@@ -5321,6 +5321,15 @@ static int wma_unified_radio_tx_power_level_stats_event_handler(void *handle,
 	rs_results = (tSirWifiRadioStat *) &link_stats_results->results[0];
 	tx_power_level_values = (uint8 *) param_tlvs->tx_time_per_power_level;
 
+	if (rs_results->total_num_tx_power_levels &&
+	    fixed_param->total_num_tx_power_levels >
+		rs_results->total_num_tx_power_levels) {
+		WMA_LOGE("%s: excess tx_power buffers:%d, total_num_tx_power_levels:%d",
+			 __func__, fixed_param->total_num_tx_power_levels,
+			 rs_results->total_num_tx_power_levels);
+		return -EINVAL;
+	}
+
 	rs_results->total_num_tx_power_levels =
 				fixed_param->total_num_tx_power_levels;
 	if (!rs_results->total_num_tx_power_levels)
@@ -15373,22 +15382,22 @@ VOS_STATUS wma_vdev_start(tp_wma_handle wma,
 	   cmd->beacon_interval = req->beacon_intval;
 		cmd->dtim_period = req->dtim_period;
 
-      /* Copy the SSID */
-      if (req->ssid.length) {
-         if (req->ssid.length < sizeof(cmd->ssid.ssid))
-            cmd->ssid.ssid_len = req->ssid.length;
-         else
-            cmd->ssid.ssid_len = sizeof(cmd->ssid.ssid);
-         vos_mem_copy(cmd->ssid.ssid, req->ssid.ssId,
-                      cmd->ssid.ssid_len);
-      }
-
-      if (req->hidden_ssid)
-         cmd->flags |= WMI_UNIFIED_VDEV_START_HIDDEN_SSID;
-
       if (req->pmf_enabled)
          cmd->flags |= WMI_UNIFIED_VDEV_START_PMF_ENABLED;
    }
+
+	if (req->hidden_ssid)
+		cmd->flags |= WMI_UNIFIED_VDEV_START_HIDDEN_SSID;
+
+	/* Copy the SSID */
+	if (req->ssid.length) {
+		if (req->ssid.length < sizeof(cmd->ssid.ssid))
+			cmd->ssid.ssid_len = req->ssid.length;
+		else
+			cmd->ssid.ssid_len = sizeof(cmd->ssid.ssid);
+		vos_mem_copy(cmd->ssid.ssid, req->ssid.ssId,
+			     cmd->ssid.ssid_len);
+	}
 
 	cmd->num_noa_descriptors = 0;
 	buf_ptr = (u_int8_t *)(((uintptr_t) cmd) + sizeof(*cmd) +
@@ -15398,11 +15407,14 @@ VOS_STATUS wma_vdev_start(tp_wma_handle wma,
 		       sizeof(wmi_p2p_noa_descriptor));
 	WMA_LOGD("%s: vdev_id %d freq %d channel %d chanmode %d is_dfs %d "
 		 "beacon interval %d dtim %d center_chan %d center_freq2 %d "
-		 "reg_info_1: 0x%x reg_info_2: 0x%x, req->max_txpow: 0x%x",
+		 "reg_info_1: 0x%x reg_info_2: 0x%x, req->max_txpow: 0x%x"
+		 "cmd flags 0x%x ssid len %d",
 		 __func__, req->vdev_id, chan->mhz, req->chan, chanmode, req->is_dfs,
 		 req->beacon_intval, cmd->dtim_period, chan->band_center_freq1,
 		 chan->band_center_freq2, chan->reg_info_1, chan->reg_info_2,
-		 req->max_txpow);
+		 req->max_txpow, cmd->flags, cmd->ssid.ssid_len);
+
+
 
 	/* Store vdev params in SAP mode which can be used in vdev restart */
 	if (intr[req->vdev_id].type == WMI_VDEV_TYPE_AP &&
@@ -16094,7 +16106,12 @@ static void wma_set_channel(tp_wma_handle wma, tpSwitchChannelParams params)
 #endif
 	req.beacon_intval = 100;
 	req.dtim_period = 1;
-   req.is_dfs = params->isDfsChannel;
+	req.is_dfs = params->isDfsChannel;
+	req.hidden_ssid = params->ssidHidden;
+	req.ssid.length = params->ssid.length;
+	if (req.ssid.length > 0)
+		vos_mem_copy(req.ssid.ssId, params->ssid.ssId,
+			     params->ssid.length);
 
 	/* In case of AP mode, once radar is detected, we need to
 	 * issuse VDEV RESTART, so we making is_channel_switch as
@@ -35822,6 +35839,16 @@ VOS_STATUS wma_mc_process_msg(v_VOID_t *vos_context, vos_msg_t *msg)
 		case WDA_SET_RX_ANTENNA:
 			wma_set_rx_antanna(wma_handle, 0, msg->bodyval);
 			break;
+		case WDA_SET_GPIO_CFG:
+			wma_set_gpio_cfg(wma_handle,
+					 (struct hal_gpio_cfg *)msg->bodyptr);
+			vos_mem_free(msg->bodyptr);
+			break;
+		case WDA_SET_GPIO_OUTPUT:
+			wma_set_gpio_output(wma_handle,
+				(struct hal_gpio_output *)msg->bodyptr);
+			vos_mem_free(msg->bodyptr);
+			break;
 		default:
 			WMA_LOGD("unknow msg type %x", msg->type);
 			/* Do Nothing? MSG Body should be freed at here */
@@ -42383,6 +42410,100 @@ VOS_STATUS wma_set_rx_antanna(void *handle,
 				      WMI_PDEV_SMART_ANT_SET_RX_ANTENNA_CMDID);
 	if (status) {
 		WMA_LOGE("Failed to send set_rx_antenna cmd");
+		wmi_buf_free(buf);
+		return VOS_STATUS_E_FAILURE;
+	}
+	return VOS_STATUS_SUCCESS;
+}
+
+/**
+ * wma_set_gpio_cfg() - Set GPIO config
+ * @handle: pointer to wma handle
+ * @gpio_cfg: parameters for GPIO config
+ *
+ * Return: VOS_STATUS_SUCCESS for success.
+ */
+VOS_STATUS wma_set_gpio_cfg(void *handle, struct hal_gpio_cfg *gpio_cfg)
+{
+	tp_wma_handle wma_handle;
+	wmi_buf_t buf;
+	int status;
+	uint32_t tag;
+	wmi_gpio_config_cmd_fixed_param *cmd;
+	int len = sizeof(*cmd);
+
+	if (!handle) {
+		WMA_LOGP(FL("Invalid handle."));
+		return VOS_STATUS_E_INVAL;
+	}
+
+	wma_handle = handle;
+	buf = wmi_buf_alloc(wma_handle->wmi_handle, len);
+	if (!buf) {
+		WMA_LOGP("%s: failed to allocate memory for WMI_GPIO_CONFIG_CMDID",
+			 __func__);
+		return VOS_STATUS_E_NOMEM;
+	}
+
+	cmd = (wmi_gpio_config_cmd_fixed_param *)wmi_buf_data(buf);
+	tag = WMITLV_TAG_STRUC_wmi_gpio_config_cmd_fixed_param;
+	len = WMITLV_GET_STRUCT_TLVLEN(wmi_gpio_config_cmd_fixed_param);
+	WMITLV_SET_HDR(&cmd->tlv_header, tag, len);
+	cmd->gpio_num = gpio_cfg->gpio_num;
+	cmd->input = gpio_cfg->input;
+	cmd->intr_mode = gpio_cfg->intr_mode;
+	cmd->mux_config_val = gpio_cfg->mux_config_val;
+	status = wmi_unified_cmd_send(wma_handle->wmi_handle, buf,
+				      sizeof(*cmd),
+				      WMI_GPIO_CONFIG_CMDID);
+	if (status) {
+		WMA_LOGE("Failed to send WMI_GPIO_CONFIG_CMDID");
+		wmi_buf_free(buf);
+		return VOS_STATUS_E_FAILURE;
+	}
+	return VOS_STATUS_SUCCESS;
+}
+
+/**
+ * wma_set_gpio_cfg() - Set GPIO config
+ * @handle: pointer to wma handle
+ * @output: parameters for GPIO output
+ *
+ * Return: VOS_STATUS_SUCCESS for success.
+ */
+VOS_STATUS wma_set_gpio_output(void *handle, struct hal_gpio_output *output)
+{
+	tp_wma_handle wma_handle;
+	wmi_buf_t buf;
+	int status;
+	uint32_t tag;
+	wmi_gpio_output_cmd_fixed_param *cmd;
+	int len = sizeof(*cmd);
+
+	if (!handle) {
+		WMA_LOGP(FL("Invalid handle."));
+		return VOS_STATUS_E_INVAL;
+	}
+
+	wma_handle = handle;
+	buf = wmi_buf_alloc(wma_handle->wmi_handle, len);
+	if (!buf) {
+		WMA_LOGP("%s: failed to allocate memory for WMI_GPIO_OUTPUT_CMDID",
+			 __func__);
+		return VOS_STATUS_E_NOMEM;
+	}
+
+	cmd = (wmi_gpio_output_cmd_fixed_param *)wmi_buf_data(buf);
+	tag = WMITLV_TAG_STRUC_wmi_gpio_output_cmd_fixed_param;
+	len = WMITLV_GET_STRUCT_TLVLEN(wmi_gpio_output_cmd_fixed_param);
+	WMITLV_SET_HDR(&cmd->tlv_header, tag, len);
+	cmd->gpio_num = output->gpio_num;
+	cmd->set = output->set;
+	status = wmi_unified_cmd_send(wma_handle->wmi_handle, buf,
+				      sizeof(*cmd),
+				      WMI_GPIO_OUTPUT_CMDID);
+	if (status) {
+		WMA_LOGE("Failed to send WMI_GPIO_OUTPUT_CMDID");
 		wmi_buf_free(buf);
 		return VOS_STATUS_E_FAILURE;
 	}

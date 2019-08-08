@@ -14376,6 +14376,9 @@ static int32_t hdd_add_tx_bitrate(struct sk_buff *skb,
 	txrate.mcs = hdd_sta_ctx->cache_conn_info.txrate.mcs;
 	txrate.legacy = hdd_sta_ctx->cache_conn_info.txrate.legacy;
 	txrate.nss = hdd_sta_ctx->cache_conn_info.txrate.nss;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+	txrate.bw = hdd_sta_ctx->cache_conn_info.txrate.bw;
+#endif
 
 	bitrate = cfg80211_calculate_bitrate(&txrate);
 
@@ -14383,6 +14386,9 @@ static int32_t hdd_add_tx_bitrate(struct sk_buff *skb,
 	hdd_sta_ctx->cache_conn_info.txrate.mcs = txrate.mcs;
 	hdd_sta_ctx->cache_conn_info.txrate.legacy = txrate.legacy;
 	hdd_sta_ctx->cache_conn_info.txrate.nss = txrate.nss;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+	hdd_sta_ctx->cache_conn_info.txrate.bw = txrate.bw;
+#endif
 
 	/* report 16-bit bitrate only if we can */
 	bitrate_compat = bitrate < (1UL << 16) ? bitrate : 0;
@@ -25012,7 +25018,11 @@ static int __wlan_hdd_cfg80211_connect( struct wiphy *wiphy,
                             req->bssid, req->ssid,
                             req->ssid_len);
                 if (bss) {
-                    cfg80211_assoc_timeout(ndev, bss);
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 11, 0))
+                    cfg80211_assoc_timeout(ndev,bss);
+#else
+                    cfg80211_send_assoc_timeout(ndev, bss->bssid);
+#endif
                     return -ETIMEDOUT;
                 }
             }
@@ -26005,6 +26015,7 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
     hdd_adapter_t *pAdapter;
     hdd_context_t *pHddCtx = (hdd_context_t*) wiphy_priv(wiphy);
     int status;
+    hdd_station_ctx_t *sta_ctx;
 
     ENTER();
 
@@ -26023,6 +26034,14 @@ static int __wlan_hdd_cfg80211_get_txpower(struct wiphy *wiphy,
     if (NULL == pAdapter) {
         hddLog(VOS_TRACE_LEVEL_FATAL, FL("pAdapter is NULL"));
         return -ENOENT;
+    }
+    sta_ctx = WLAN_HDD_GET_STATION_CTX_PTR(pAdapter);
+
+    if (sta_ctx->conn_info.connState != eConnectionState_Associated) {
+        hddLog(LOG1, FL("Not associated"));
+        /*To keep GUI happy */
+        *dbm = 0;
+        return 0;
     }
 
     MTRACE(vos_trace(VOS_MODULE_ID_HDD, TRACE_CODE_HDD_CFG80211_GET_TXPOWER,
@@ -27725,6 +27744,9 @@ static int __wlan_hdd_cfg80211_get_station(struct wiphy *wiphy,
     pHddStaCtx->conn_info.txrate.mcs = sinfo->txrate.mcs;
     pHddStaCtx->conn_info.txrate.legacy = sinfo->txrate.legacy;
     pHddStaCtx->conn_info.txrate.nss = sinfo->txrate.nss;
+#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 0, 0))
+    pHddStaCtx->conn_info.txrate.bw = sinfo->txrate.bw;
+#endif
     vos_mem_copy(&pHddStaCtx->cache_conn_info.txrate,
                  &pHddStaCtx->conn_info.txrate,
                  sizeof(pHddStaCtx->conn_info.txrate));
@@ -31228,10 +31250,10 @@ static int __wlan_hdd_cfg80211_channel_switch(struct wiphy *wiphy,
 	}
 
 	if (channel != current_channel &&
-	    target_sub20_chan_width == current_sub20_chan_width) {
+	    target_sub20_chan_width == current_sub20_chan_width &&
+	    current_sub20_chan_width == NL80211_CHAN_WIDTH_20_NOHT) {
 		ret = hdd_softap_set_channel_change(dev, channel);
-	} else if (sap_config->sub20_switch_mode == SUB20_MANUAL &&
-		target_sub20_chan_width != current_sub20_chan_width) {
+	} else if (sap_config->sub20_switch_mode == SUB20_MANUAL) {
 		ret = hdd_softap_set_channel_sub20_chanwidth_change(
 					dev, csa_params->chandef.width,
 					channel);
